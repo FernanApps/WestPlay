@@ -61,10 +61,16 @@ if not errorlevel 1 (
 )
 
 rem El servidor de desarrollo (Vite) usa el puerto 5173: si quedo uno colgado de otra
-rem ejecucion, tauri dev fallaria al arrancar y la ventana se cerraria sola.
+rem ejecucion, tauri dev fallaria al arrancar. Solo se cierra si es node (Vite); otro
+rem proceso que lo use se avisa y no se toca.
 for /f "tokens=5" %%p in ('netstat -ano ^| findstr /R /C:":5173 .*LISTENING"') do (
-  echo Liberando el puerto 5173 ^(proceso %%p^)...
-  taskkill /PID %%p /F >nul 2>nul
+  tasklist /FI "PID eq %%p" /NH 2>nul | find /I "node.exe" >nul
+  if not errorlevel 1 (
+    echo Liberando el puerto 5173 ^(node, PID %%p^)...
+    taskkill /PID %%p /F >nul 2>nul
+  ) else (
+    echo [AVISO] El puerto 5173 lo usa otro proceso ^(PID %%p^); no lo cierro.
+  )
 )
 
 echo Compilando y lanzando WestPlay...
