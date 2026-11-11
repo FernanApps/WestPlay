@@ -371,6 +371,8 @@ const ZIP64_LOCATOR_SIZE: usize = 20;
 const ZIP64_EXTRA: u16 = 0x0001;
 /// A local header's fixed part, before its name and extra field.
 const ZIP_LOCAL_SIZE: usize = 30;
+/// A central directory entry's fixed part, before its name, extra field and comment.
+const ZIP_CENTRAL_SIZE: usize = 46;
 /// The end-of-directory record's fixed part, and the most its comment can add.
 const ZIP_END_SIZE: usize = 22;
 const ZIP_MAX_COMMENT: usize = 0xFFFF;
@@ -453,6 +455,14 @@ fn zip_entries(file: &File) -> Result<ZipIndex, ArchiveError> {
     };
     let size =
         usize::try_from(size).map_err(|_| ArchiveError::Corrupt("zip directory larger than this PC can read"))?;
+    // A corrupt or hostile header could name a directory past the file, or more entries than that directory
+    // could hold (a ZIP64 count is 64 bits): refused before anything is allocated for it.
+    if offset.checked_add(size as u64).is_none_or(|end| end > length) {
+        return Err(ArchiveError::Corrupt("zip directory beyond the file"));
+    }
+    if count as u64 > size as u64 / ZIP_CENTRAL_SIZE as u64 {
+        return Err(ArchiveError::Corrupt("more zip entries than its directory could hold"));
+    }
     let directory = read_exact(file, offset, size)?;
     let mut r = Reader::new(&directory);
     let mut entries = HashMap::with_capacity(count);
@@ -1095,6 +1105,18 @@ mod tests {
         assert_eq!(archive.read("manifest.sii").unwrap().as_deref(), Some(&b"SiiNunit { }"[..]));
         assert_eq!(archive.read("def/world/road_look.mod.sii").unwrap(), Some(def));
         assert_eq!(archive.list("def/world").unwrap().unwrap().files, ["road_look.mod.sii"]);
+    }
+
+    #[test]
+    fn refuses_a_zip64_directory_that_lies_outside_the_file() {
+        let mut zip = build_zip64(&[("manifest.sii", b"SiiNunit { }", false)]);
+        // The ZIP64 end record's central directory offset, set past the file's end.
+        let at = zip.windows(4).rposition(|window| window == ZIP64_END).unwrap();
+        zip[at + 48..at + 56].copy_from_slice(&u64::MAX.to_le_bytes());
+        let dir = TempDir::new();
+        let path = dir.path.join("test.scs");
+        std::fs::write(&path, &zip).unwrap();
+        assert!(matches!(Archive::open(&path), Err(ArchiveError::Corrupt(_))));
     }
 
     #[test]
