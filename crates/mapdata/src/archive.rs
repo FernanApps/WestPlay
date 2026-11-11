@@ -5,7 +5,7 @@
 //!
 //! - Zip: the central directory (from the end-of-directory record) names each file and says where its
 //!   local header is; the file's data follows that header, stored or deflated. Directories are what the
-//!   paths imply. Encrypted entries and ZIP64 archives aren't read.
+//!   paths imply. Encrypted entries aren't read.
 //!
 //! The layouts follow ts-map's reader (MIT, see THIRD_PARTY_NOTICES.md):
 //!
@@ -362,11 +362,71 @@ const ZIP_LOCAL: &[u8] = b"PK\x03\x04";
 const ZIP_EMPTY: &[u8] = b"PK\x05\x06";
 const ZIP_CENTRAL: &[u8] = b"PK\x01\x02";
 const ZIP_END: &[u8] = b"PK\x05\x06";
+/// ZIP64's end record and its locator, whose fixed parts hold the numbers the end record couldn't.
+const ZIP64_END: &[u8] = b"PK\x06\x06";
+const ZIP64_LOCATOR: &[u8] = b"PK\x06\x07";
+const ZIP64_END_SIZE: usize = 56;
+const ZIP64_LOCATOR_SIZE: usize = 20;
+/// A central directory entry's extra field: its id and the ZIP64 values it may hold.
+const ZIP64_EXTRA: u16 = 0x0001;
 /// A local header's fixed part, before its name and extra field.
 const ZIP_LOCAL_SIZE: usize = 30;
 /// The end-of-directory record's fixed part, and the most its comment can add.
 const ZIP_END_SIZE: usize = 22;
 const ZIP_MAX_COMMENT: usize = 0xFFFF;
+
+/// A ZIP64 end record's number of entries, its central directory's size and its offset, from the locator just
+/// before the end record (`before` is the file up to that record).
+fn zip64_end(file: &File, before: &[u8]) -> Result<(usize, u64, u64), ArchiveError> {
+    let locator = before
+        .get(before.len().saturating_sub(ZIP64_LOCATOR_SIZE)..)
+        .filter(|locator| locator.starts_with(ZIP64_LOCATOR))
+        .ok_or(ArchiveError::Corrupt("zip64 end without its locator"))?;
+    let mut r = Reader::new(&locator[8..]);
+    let record = read_exact(file, r.u64()?, ZIP64_END_SIZE)?;
+    let mut r = Reader::new(&record);
+    if r.bytes(4)? != ZIP64_END {
+        return Err(ArchiveError::Corrupt("zip64 locator without its record"));
+    }
+    r.bytes(8 + 4 + 8)?;
+    let _on_this_disk = r.u64()?;
+    let count = r.u64()?;
+    let size = r.u64()?;
+    let offset = r.u64()?;
+    let count = usize::try_from(count).map_err(|_| ArchiveError::Corrupt("zip with too many entries"))?;
+    Ok((count, size, offset))
+}
+
+/// A central entry's stored and unpacked sizes and local header offset, read from its extra field where the
+/// entry's own `u32`s couldn't hold them (`u32::MAX`).
+fn zip64_entry(extra: &[u8], stored: u32, unpacked: u32, local: u64) -> Result<(u32, u32, u64), ArchiveError> {
+    let (mut stored, mut unpacked, mut local) = (stored, unpacked, local);
+    let mut r = Reader::new(extra);
+    while r.remaining() >= 4 {
+        let id = r.u16()?;
+        let length = r.u16()? as usize;
+        let field = r.bytes(length)?;
+        if id != ZIP64_EXTRA {
+            continue;
+        }
+        let mut r = Reader::new(field);
+        // In this order, each only if its `u32` in the entry overflowed.
+        if unpacked == u32::MAX {
+            unpacked = a_u32(r.u64()?, "an entry larger than 4 GB")?;
+        }
+        if stored == u32::MAX {
+            stored = a_u32(r.u64()?, "an entry larger than 4 GB")?;
+        }
+        if local == u64::from(u32::MAX) {
+            local = r.u64()?;
+        }
+    }
+    Ok((stored, unpacked, local))
+}
+
+fn a_u32(value: u64, what: &'static str) -> Result<u32, ArchiveError> {
+    u32::try_from(value).map_err(|_| ArchiveError::Unsupported { hash: 0, what: what.into() })
+}
 
 /// A zip's files (by their paths' hashes) and the directories their paths imply, from its central directory.
 /// A zip's files and its directories, each by its path's hash.
@@ -381,13 +441,19 @@ fn zip_entries(file: &File) -> Result<ZipIndex, ArchiveError> {
         .find(|&at| tail[at..].starts_with(ZIP_END))
         .ok_or(ArchiveError::Corrupt("zip without its end-of-directory record"))?;
     let mut r = Reader::new(&tail[end + 10..]);
-    let count = r.u16()? as usize;
-    let size = r.u32()?;
-    let offset = r.u32()?;
-    if count == 0xFFFF || size == u32::MAX || offset == u32::MAX {
-        return Err(ArchiveError::Unsupported { hash: 0, what: "a ZIP64 archive".into() });
-    }
-    let directory = read_exact(file, offset.into(), size as usize)?;
+    let count16 = r.u16()? as usize;
+    let size32 = r.u32()?;
+    let offset32 = r.u32()?;
+    // ZIP64 holds the numbers too big for the end record in a record of its own, its locator just before the
+    // end one. Some packers write a ZIP64 archive for mods of a few megabytes: read as any other.
+    let (count, size, offset) = if count16 == 0xFFFF || size32 == u32::MAX || offset32 == u32::MAX {
+        zip64_end(file, &tail[..end])?
+    } else {
+        (count16, u64::from(size32), u64::from(offset32))
+    };
+    let size =
+        usize::try_from(size).map_err(|_| ArchiveError::Corrupt("zip directory larger than this PC can read"))?;
+    let directory = read_exact(file, offset, size)?;
     let mut r = Reader::new(&directory);
     let mut entries = HashMap::with_capacity(count);
     let mut listings: HashMap<String, (BTreeSet<String>, BTreeSet<String>)> = HashMap::new();
@@ -411,7 +477,10 @@ fn zip_entries(file: &File) -> Result<ZipIndex, ArchiveError> {
         r.bytes(8)?;
         let local = r.u32()?;
         let name = String::from_utf8_lossy(r.bytes(name_length)?).replace('\\', "/");
-        r.bytes(extra_length + comment_length)?;
+        let extra = r.bytes(extra_length)?;
+        r.bytes(comment_length)?;
+        // Sizes and the local header's offset a ZIP64 entry's fields couldn't hold are in its extra field.
+        let (stored, unpacked, local) = zip64_entry(extra, stored, unpacked, local.into())?;
         let path = name.trim_start_matches('/').to_owned();
         // The directories the path is in (and, ending in a slash, itself one).
         let directory = path.ends_with('/');
@@ -439,7 +508,7 @@ fn zip_entries(file: &File) -> Result<ZipIndex, ArchiveError> {
             8 => Compression::ZipDeflate,
             other => Compression::Unknown(other as u8),
         };
-        let content = Content::Stored(Stored { offset: local.into(), size: unpacked, stored, compression });
+        let content = Content::Stored(Stored { offset: local, size: unpacked, stored, compression });
         entries.insert(salted_path_hash(&path, 0), Entry { directory: false, content });
     }
     let listings = listings
@@ -919,6 +988,75 @@ mod tests {
         data
     }
 
+    /// A ZIP64 zip: the end record's numbers overflow (`0xFFFF`/`0xFFFFFFFF`) into its own record and locator, and
+    /// each entry's sizes and local header offset into its extra field.
+    fn build_zip64(entries: &[(&str, &[u8], bool)]) -> Vec<u8> {
+        use std::io::Write;
+        let (mut data, mut directory) = (Vec::new(), Vec::new());
+        for (path, contents, deflated) in entries {
+            let stored = if *deflated {
+                let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(contents).unwrap();
+                encoder.finish().unwrap()
+            } else {
+                contents.to_vec()
+            };
+            let method: u16 = if *deflated { 8 } else { 0 };
+            let local = data.len() as u64;
+            data.extend(b"PK\x03\x04");
+            data.extend([45u8, 0, 0, 0]);
+            data.extend(method.to_le_bytes());
+            data.extend([0u8; 8]);
+            data.extend(0u32.to_le_bytes());
+            data.extend(0u32.to_le_bytes());
+            data.extend((path.len() as u16).to_le_bytes());
+            data.extend(0u16.to_le_bytes());
+            data.extend(path.as_bytes());
+            data.extend(&stored);
+            directory.extend(b"PK\x01\x02");
+            directory.extend([45u8, 0, 45, 0, 0, 0]);
+            directory.extend(method.to_le_bytes());
+            directory.extend([0u8; 8]);
+            directory.extend(u32::MAX.to_le_bytes());
+            directory.extend(u32::MAX.to_le_bytes());
+            directory.extend((path.len() as u16).to_le_bytes());
+            directory.extend(28u16.to_le_bytes());
+            directory.extend(0u16.to_le_bytes());
+            directory.extend([0u8; 8]);
+            directory.extend(u32::MAX.to_le_bytes());
+            directory.extend(path.as_bytes());
+            directory.extend(1u16.to_le_bytes());
+            directory.extend(24u16.to_le_bytes());
+            directory.extend((contents.len() as u64).to_le_bytes());
+            directory.extend((stored.len() as u64).to_le_bytes());
+            directory.extend(local.to_le_bytes());
+        }
+        let directory_offset = data.len() as u64;
+        data.extend(&directory);
+        let record = data.len() as u64;
+        data.extend(b"PK\x06\x06");
+        data.extend(44u64.to_le_bytes());
+        data.extend([45u8, 0, 45, 0]);
+        data.extend(0u32.to_le_bytes());
+        data.extend(0u32.to_le_bytes());
+        data.extend((entries.len() as u64).to_le_bytes());
+        data.extend((entries.len() as u64).to_le_bytes());
+        data.extend((directory.len() as u64).to_le_bytes());
+        data.extend(directory_offset.to_le_bytes());
+        data.extend(b"PK\x06\x07");
+        data.extend(0u32.to_le_bytes());
+        data.extend(record.to_le_bytes());
+        data.extend(1u32.to_le_bytes());
+        data.extend(b"PK\x05\x06");
+        data.extend([0u8; 4]);
+        data.extend(0xFFFFu16.to_le_bytes());
+        data.extend(0xFFFFu16.to_le_bytes());
+        data.extend(u32::MAX.to_le_bytes());
+        data.extend(u32::MAX.to_le_bytes());
+        data.extend(0u16.to_le_bytes());
+        data
+    }
+
     #[test]
     fn reads_a_zip_mod() {
         let def = b"SiiNunit
@@ -943,6 +1081,20 @@ mod tests {
         assert_eq!(archive.list("map").unwrap().unwrap().dirs, ["mymap"]);
         assert_eq!(archive.list("/def/world/").unwrap().unwrap().files, ["road_look.mod.sii"]);
         assert_eq!(archive.read("missing.sii").unwrap(), None);
+    }
+
+    #[test]
+    fn reads_a_zip64_mod() {
+        // A packer's ZIP64: the end record's numbers overflow, and each entry's real sizes and local header
+        // offset are in its extra field (a mod of a few megabytes, as the Peru map mods were packed).
+        let def = b"def/world/road_look.mod.sii".repeat(30);
+        let (archive, _dir) = open(&build_zip64(&[
+            ("manifest.sii", b"SiiNunit { }", false),
+            ("def/world/road_look.mod.sii", &def, true),
+        ]));
+        assert_eq!(archive.read("manifest.sii").unwrap().as_deref(), Some(&b"SiiNunit { }"[..]));
+        assert_eq!(archive.read("def/world/road_look.mod.sii").unwrap(), Some(def));
+        assert_eq!(archive.list("def/world").unwrap().unwrap().files, ["road_look.mod.sii"]);
     }
 
     #[test]
