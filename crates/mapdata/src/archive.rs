@@ -403,6 +403,7 @@ fn zip64_end(file: &File, before: &[u8]) -> Result<(usize, u64, u64), ArchiveErr
 /// entry's own `u32`s couldn't hold them (`u32::MAX`).
 fn zip64_entry(extra: &[u8], stored: u32, unpacked: u32, local: u64) -> Result<(u32, u32, u64), ArchiveError> {
     let (mut stored, mut unpacked, mut local) = (stored, unpacked, local);
+    let (mut found_unpacked, mut found_stored, mut found_local) = (false, false, false);
     let mut r = Reader::new(extra);
     while r.remaining() >= 4 {
         let id = r.u16()?;
@@ -415,13 +416,23 @@ fn zip64_entry(extra: &[u8], stored: u32, unpacked: u32, local: u64) -> Result<(
         // In this order, each only if its `u32` in the entry overflowed.
         if unpacked == u32::MAX {
             unpacked = a_u32(r.u64()?, "an entry larger than 4 GB")?;
+            found_unpacked = true;
         }
         if stored == u32::MAX {
             stored = a_u32(r.u64()?, "an entry larger than 4 GB")?;
+            found_stored = true;
         }
         if local == u64::from(u32::MAX) {
             local = r.u64()?;
+            found_local = true;
         }
+    }
+    // A field that overflowed without ZIP64's values to fill it in: the entry can't be found or sized.
+    if (unpacked == u32::MAX && !found_unpacked)
+        || (stored == u32::MAX && !found_stored)
+        || (local == u64::from(u32::MAX) && !found_local)
+    {
+        return Err(ArchiveError::Corrupt("zip64 entry without its sizes or offset"));
     }
     Ok((stored, unpacked, local))
 }
@@ -1113,6 +1124,19 @@ mod tests {
         // The ZIP64 end record's central directory offset, set past the file's end.
         let at = zip.windows(4).rposition(|window| window == ZIP64_END).unwrap();
         zip[at + 48..at + 56].copy_from_slice(&u64::MAX.to_le_bytes());
+        let dir = TempDir::new();
+        let path = dir.path.join("test.scs");
+        std::fs::write(&path, &zip).unwrap();
+        assert!(matches!(Archive::open(&path), Err(ArchiveError::Corrupt(_))));
+    }
+
+    #[test]
+    fn refuses_a_zip64_entry_without_its_sizes() {
+        let mut zip = build_zip64(&[("manifest.sii", b"SiiNunit { }", false)]);
+        // Its ZIP64 extra field relabelled as one this reader doesn't know: the sizes it overflowed stay
+        // unknown, and the entry is refused rather than read at an offset of `u32::MAX`.
+        let at = zip.windows(4).position(|window| window == [1u8, 0, 24, 0]).unwrap();
+        zip[at] = 2;
         let dir = TempDir::new();
         let path = dir.path.join("test.scs");
         std::fs::write(&path, &zip).unwrap();
